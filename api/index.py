@@ -77,27 +77,31 @@ async def remove_bg(
         d_min, d_max = pred.min(), pred.max()
         norm = (pred - d_min) / (d_max - d_min + 1e-8)
 
-        # ২. সাদা হ্যালো (White Halo) দূর করার পারফেক্ট কাটঅফ
-        # ৫০%-এর নিচের কোনো সাদা আলো বা ব্যাকগ্রাউন্ড আভা থাকবে না
-        low_t = 0.50
-        high_t = 0.82
-        norm = np.clip((norm - low_t) / (high_t - low_t), 0.0, 1.0)
+        # ২. হাই-রেজুলিউশন গ্র্যাডিয়েন্ট তৈরি (খাবরা ভাব দূর করতে)
+        mask_320 = Image.fromarray((norm * 255).astype(np.uint8), mode="L")
+        mask_hires = mask_320.resize((orig_w, orig_h), Image.Resampling.LANCZOS)
+        alpha_raw = np.array(mask_hires).astype(np.float32) / 255.0
 
-        # ৩. আল্ট্রা-শার্প LANCZOS রিসাইজিং
-        mask_320 = (norm * 255).astype(np.uint8)
-        mask = Image.fromarray(mask_320, mode="L").resize(
-            (orig_w, orig_h), 
-            Image.Resampling.LANCZOS
-        )
+        # ৩. স্মুথস্টেপ কার্ভ (কোনো কর্কশ খাঁজ থাকবে না, সিল্কি স্মুথ এজ)
+        alpha = np.clip((alpha_raw - 0.25) / (0.80 - 0.25), 0.0, 1.0)
+        alpha = alpha * alpha * (3.0 - 2.0 * alpha)
 
-        # ৪. অবশিষ্ট কোনো হালকা সাদা ব্লিড থাকলে তা পুরোপুরি মুছে ফেলা
-        mask_arr = np.array(mask)
-        mask_arr = np.where(mask_arr < 45, 0, mask_arr)
-        mask = Image.fromarray(mask_arr, mode="L")
+        # ৪. কালার ডিকন্টামিনেশন (কিনারের মিশে থাকা সাদা রঙ শুষে নেওয়া)
+        img_np = np.array(img).astype(np.float32)
+        bg_mask = alpha < 0.05
+        if np.any(bg_mask):
+            bg_color = np.mean(img_np[bg_mask], axis=0)
+        else:
+            bg_color = np.array([255.0, 255.0, 255.0], dtype=np.float32)
+
+        a = np.expand_dims(alpha, axis=2)
+        decontaminated = (img_np - (1.0 - a) * bg_color) / np.maximum(a, 0.25)
+        clean_rgb = np.where((a > 0.02) & (a < 0.98), np.clip(decontaminated, 0, 255), img_np)
 
         # ৫. ট্রান্সপারেন্ট পিএনজি তৈরি
-        result = img.copy()
-        result.putalpha(mask)
+        result = Image.fromarray(clean_rgb.astype(np.uint8), mode="RGB")
+        final_mask = Image.fromarray((alpha * 255).astype(np.uint8), mode="L")
+        result.putalpha(final_mask)
 
         out_io = io.BytesIO()
         result.save(out_io, format="PNG")
