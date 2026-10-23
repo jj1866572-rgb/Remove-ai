@@ -7,7 +7,7 @@ from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 import onnxruntime as ort
-from PIL import Image, ImageFilter
+from PIL import Image
 
 app = FastAPI(title="24/7 BG Remover API")
 
@@ -73,22 +73,20 @@ async def remove_bg(
         outputs = ort_session.run(None, {input_name: img_data})
         pred = outputs[0][0, 0]
 
-        # ১. Sigmoid অ্যাক্টিভেশন (আসল প্রোবাবিলিটি বের করা)
-        pred = 1.0 / (1.0 + np.exp(-pred))
+        # ১. সঠিক নরমালাইজেশন
+        d_min, d_max = pred.min(), pred.max()
+        norm = (pred - d_min) / (d_max - d_min + 1e-8)
 
-        # ২. থ্রেশহোল্ড কন্ট্রাস্ট (বর্ডারের সাদা আভা ছেঁটে ফেলা)
-        # ২০% এর নিচে থাকা সব আবছা সাদা পিক্সেলকে ১০০% ট্রান্সপারেন্ট করে দেওয়া
-        low_cut = 0.25
-        high_cut = 0.85
-        pred = np.clip((pred - low_cut) / (high_cut - low_cut), 0, 1)
+        # ২. স্মুথ-কন্ট্রাস্ট ফিল্টার
+        # ৩৫%-এর নিচের সব ব্যাকগ্রাউন্ড পুরোপুরি ০ (ভ্যানিশ)
+        # ৬৫%-এর ওপরের সব কিছু ১০০% সলিড (কোনো অপাসিটি ড্রপ হবে না)
+        norm = np.clip((norm - 0.35) / (0.65 - 0.35), 0.0, 1.0)
 
-        mask_arr = (pred * 255).astype(np.uint8)
+        # ৩. মাস্ক তৈরি এবং সাইজ অ্যাডজাস্ট
+        mask_arr = (norm * 255).astype(np.uint8)
         mask = Image.fromarray(mask_arr, mode="L").resize((orig_w, orig_h), Image.BILINEAR)
 
-        # ৩. ডিফ্রিঞ্জ ফিল্টার (সীমানা থেকে ১ পিক্সেল সাদা বর্ডার স্বয়ংক্রিয়ভাবে মুছে দেওয়া)
-        mask = mask.filter(ImageFilter.MinFilter(3))
-
-        # ট্রান্সপারেন্ট ব্যাকগ্রাউন্ড সেট
+        # ট্রান্সপারেন্ট ছবি তৈরি
         result = img.copy()
         result.putalpha(mask)
 
