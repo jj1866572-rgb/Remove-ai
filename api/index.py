@@ -7,11 +7,10 @@ from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 import onnxruntime as ort
-from PIL import Image
+from PIL import Image, ImageFilter
 
 app = FastAPI(title="24/7 BG Remover API")
 
-# অ্যান্ড্রয়েড অ্যাপের সংযোগ নিশ্চিত করতে CORS অন করা
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,7 +27,6 @@ def get_session():
     global session
     if session is None:
         if not os.path.exists(MODEL_PATH):
-            # গিটহাব থেকে ৪.৭ মেগাবাইট মডেল নামানোর নিরাপদ রিকোয়েস্ট
             req = urllib.request.Request(
                 MODEL_URL, 
                 headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -38,13 +36,11 @@ def get_session():
         session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
     return session
 
-# সার্ভার সচল আছে কিনা চেক করার রুট
 @app.get("/")
 @app.get("/api")
 def health():
-    return {"status": "online", "message": "Background Remover API is ready for Android App!"}
+    return {"status": "online", "message": "BG Remover is Ready!"}
 
-# অ্যাপ থেকে আসা সমস্ত POST রিকোয়েস্ট হ্যান্ডেল করা
 @app.post("/")
 @app.post("/api")
 @app.post("/remove-bg")
@@ -53,11 +49,9 @@ async def remove_bg(
     image: Optional[UploadFile] = File(None),
     file: Optional[UploadFile] = File(None)
 ):
-    # আপনার অ্যাপের 'image' অথবা সাধারণ 'file' ফিল্ড উভয়ই সাপোর্ট করবে
     target = image if image is not None else file
-    
     if target is None:
-        raise HTTPException(status_code=400, detail="কোনো ছবি পাওয়া যায়নি!")
+        raise HTTPException(status_code=400, detail="No image provided")
 
     try:
         contents = await target.read()
@@ -73,18 +67,28 @@ async def remove_bg(
         img_data = np.transpose(img_data, (2, 0, 1))
         img_data = np.expand_dims(img_data, axis=0)
 
-        # ৪.৭ এমবি u2netp মডেল রান করা
+        # মডেল রান
         ort_session = get_session()
         input_name = ort_session.get_inputs()[0].name
         outputs = ort_session.run(None, {input_name: img_data})
         pred = outputs[0][0, 0]
 
-        # ব্যাকগ্রাউন্ড মাস্কিং
-        d_min, d_max = pred.min(), pred.max()
-        mask_arr = ((pred - d_min) / (d_max - d_min + 1e-8) * 255).astype(np.uint8)
+        # ১. Sigmoid অ্যাক্টিভেশন (আসল প্রোবাবিলিটি বের করা)
+        pred = 1.0 / (1.0 + np.exp(-pred))
+
+        # ২. থ্রেশহোল্ড কন্ট্রাস্ট (বর্ডারের সাদা আভা ছেঁটে ফেলা)
+        # ২০% এর নিচে থাকা সব আবছা সাদা পিক্সেলকে ১০০% ট্রান্সপারেন্ট করে দেওয়া
+        low_cut = 0.25
+        high_cut = 0.85
+        pred = np.clip((pred - low_cut) / (high_cut - low_cut), 0, 1)
+
+        mask_arr = (pred * 255).astype(np.uint8)
         mask = Image.fromarray(mask_arr, mode="L").resize((orig_w, orig_h), Image.BILINEAR)
 
-        # ট্রান্সপারেন্ট PNG ইমেজ রিটার্ন করা
+        # ৩. ডিফ্রিঞ্জ ফিল্টার (সীমানা থেকে ১ পিক্সেল সাদা বর্ডার স্বয়ংক্রিয়ভাবে মুছে দেওয়া)
+        mask = mask.filter(ImageFilter.MinFilter(3))
+
+        # ট্রান্সপারেন্ট ব্যাকগ্রাউন্ড সেট
         result = img.copy()
         result.putalpha(mask)
 
