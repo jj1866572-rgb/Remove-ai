@@ -67,29 +67,35 @@ async def remove_bg(
         img_data = np.transpose(img_data, (2, 0, 1))
         img_data = np.expand_dims(img_data, axis=0)
 
-        # মডেল রান করা
+        # মডেল রান
         ort_session = get_session()
         input_name = ort_session.get_inputs()[0].name
         outputs = ort_session.run(None, {input_name: img_data})
         pred = outputs[0][0, 0]
 
-        # ১. নরমাল প্রবাবিলিটি স্কেলিং
+        # ১. প্রবাবিলিটি স্কেলিং
         d_min, d_max = pred.min(), pred.max()
         norm = (pred - d_min) / (d_max - d_min + 1e-8)
 
-        # ২. ন্যাচারাল ক্লিন কার্ভ (কোনো ব্লার বা কাটাকুটি ছাড়া নিখুঁত এজ)
-        # ব্যাকগ্রাউন্ড পুরোপুরি জিরো হবে, মানুষ ১০০% সলিড থাকবে
-        norm = np.clip(norm, 0.0, 1.0)
-        norm = norm ** 1.8  # হালকা পাওয়ার কার্ভ যা ব্যাকগ্রাউন্ড ব্লিড মুছে দেয় কিন্তু ধারের ধারালো ভাব ধরে রাখে
+        # ২. সাদা হ্যালো (White Halo) দূর করার পারফেক্ট কাটঅফ
+        # ৫০%-এর নিচের কোনো সাদা আলো বা ব্যাকগ্রাউন্ড আভা থাকবে না
+        low_t = 0.50
+        high_t = 0.82
+        norm = np.clip((norm - low_t) / (high_t - low_t), 0.0, 1.0)
 
-        # ৩. হাই-কোয়ালিটি LANCZOS রিসাইজিং (যাতে কোনো পিক্সেল ভাঙা বা খাবরা ভাব না থাকে)
+        # ৩. আল্ট্রা-শার্প LANCZOS রিসাইজিং
         mask_320 = (norm * 255).astype(np.uint8)
         mask = Image.fromarray(mask_320, mode="L").resize(
             (orig_w, orig_h), 
             Image.Resampling.LANCZOS
         )
 
-        # ৪. ট্রান্সপারেন্ট পিএনজি তৈরি
+        # ৪. অবশিষ্ট কোনো হালকা সাদা ব্লিড থাকলে তা পুরোপুরি মুছে ফেলা
+        mask_arr = np.array(mask)
+        mask_arr = np.where(mask_arr < 45, 0, mask_arr)
+        mask = Image.fromarray(mask_arr, mode="L")
+
+        # ৫. ট্রান্সপারেন্ট পিএনজি তৈরি
         result = img.copy()
         result.putalpha(mask)
 
