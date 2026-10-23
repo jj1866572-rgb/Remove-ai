@@ -7,7 +7,7 @@ from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 import onnxruntime as ort
-from PIL import Image
+from PIL import Image, ImageFilter
 
 app = FastAPI(title="24/7 BG Remover API")
 
@@ -77,16 +77,21 @@ async def remove_bg(
         d_min, d_max = pred.min(), pred.max()
         norm = (pred - d_min) / (d_max - d_min + 1e-8)
 
-        # ২. স্মুথ-কন্ট্রাস্ট ফিল্টার
-        # ৩৫%-এর নিচের সব ব্যাকগ্রাউন্ড পুরোপুরি ০ (ভ্যানিশ)
-        # ৬৫%-এর ওপরের সব কিছু ১০০% সলিড (কোনো অপাসিটি ড্রপ হবে না)
-        norm = np.clip((norm - 0.35) / (0.65 - 0.35), 0.0, 1.0)
+        # ২. ১০০% নিখুঁত বাইনারি মাস্ক (Strict Binary Mask)
+        # ব্যাকগ্রাউন্ড বাধ্যতামূলকভাবে পুরোপুরি ০ (১০০% ভ্যানিশ)
+        # মানুষ বাধ্যতামূলকভাবে পুরোপুরি ২৫৫ (১০০% সলিড ও স্পষ্ট)
+        mask_binary = (norm >= 0.5).astype(np.uint8) * 255
 
-        # ৩. মাস্ক তৈরি এবং সাইজ অ্যাডজাস্ট
-        mask_arr = (norm * 255).astype(np.uint8)
-        mask = Image.fromarray(mask_arr, mode="L").resize((orig_w, orig_h), Image.BILINEAR)
+        # ৩. আসল ছবির সাইজে নেওয়া
+        mask = Image.fromarray(mask_binary, mode="L").resize((orig_w, orig_h), Image.BILINEAR)
 
-        # ট্রান্সপারেন্ট ছবি তৈরি
+        # ৪. সীমানা থেকে সাদা/ধূসর দাগ ছেঁটে ফেলা (Defringe)
+        mask = mask.filter(ImageFilter.MinFilter(3))
+
+        # ৫. মসৃণ বর্ডার (Smooth Anti-aliasing)
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=1))
+
+        # ট্রান্সপারেন্ট ছবি আউটপুট
         result = img.copy()
         result.putalpha(mask)
 
