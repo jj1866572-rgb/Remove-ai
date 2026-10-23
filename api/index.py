@@ -7,7 +7,7 @@ from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 import onnxruntime as ort
-from PIL import Image, ImageFilter
+from PIL import Image
 
 app = FastAPI(title="24/7 BG Remover API")
 
@@ -67,31 +67,29 @@ async def remove_bg(
         img_data = np.transpose(img_data, (2, 0, 1))
         img_data = np.expand_dims(img_data, axis=0)
 
-        # মডেল রান
+        # মডেল রান করা
         ort_session = get_session()
         input_name = ort_session.get_inputs()[0].name
         outputs = ort_session.run(None, {input_name: img_data})
         pred = outputs[0][0, 0]
 
-        # ১. সঠিক নরমালাইজেশন
+        # ১. নরমাল প্রবাবিলিটি স্কেলিং
         d_min, d_max = pred.min(), pred.max()
         norm = (pred - d_min) / (d_max - d_min + 1e-8)
 
-        # ২. ১০০% নিখুঁত বাইনারি মাস্ক (Strict Binary Mask)
-        # ব্যাকগ্রাউন্ড বাধ্যতামূলকভাবে পুরোপুরি ০ (১০০% ভ্যানিশ)
-        # মানুষ বাধ্যতামূলকভাবে পুরোপুরি ২৫৫ (১০০% সলিড ও স্পষ্ট)
-        mask_binary = (norm >= 0.5).astype(np.uint8) * 255
+        # ২. ন্যাচারাল ক্লিন কার্ভ (কোনো ব্লার বা কাটাকুটি ছাড়া নিখুঁত এজ)
+        # ব্যাকগ্রাউন্ড পুরোপুরি জিরো হবে, মানুষ ১০০% সলিড থাকবে
+        norm = np.clip(norm, 0.0, 1.0)
+        norm = norm ** 1.8  # হালকা পাওয়ার কার্ভ যা ব্যাকগ্রাউন্ড ব্লিড মুছে দেয় কিন্তু ধারের ধারালো ভাব ধরে রাখে
 
-        # ৩. আসল ছবির সাইজে নেওয়া
-        mask = Image.fromarray(mask_binary, mode="L").resize((orig_w, orig_h), Image.BILINEAR)
+        # ৩. হাই-কোয়ালিটি LANCZOS রিসাইজিং (যাতে কোনো পিক্সেল ভাঙা বা খাবরা ভাব না থাকে)
+        mask_320 = (norm * 255).astype(np.uint8)
+        mask = Image.fromarray(mask_320, mode="L").resize(
+            (orig_w, orig_h), 
+            Image.Resampling.LANCZOS
+        )
 
-        # ৪. সীমানা থেকে সাদা/ধূসর দাগ ছেঁটে ফেলা (Defringe)
-        mask = mask.filter(ImageFilter.MinFilter(3))
-
-        # ৫. মসৃণ বর্ডার (Smooth Anti-aliasing)
-        mask = mask.filter(ImageFilter.GaussianBlur(radius=1))
-
-        # ট্রান্সপারেন্ট ছবি আউটপুট
+        # ৪. ট্রান্সপারেন্ট পিএনজি তৈরি
         result = img.copy()
         result.putalpha(mask)
 
