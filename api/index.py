@@ -7,9 +7,9 @@ from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 import onnxruntime as ort
-from PIL import Image, ImageFilter
+from PIL import Image
 
-app = FastAPI(title="24/7 Ultra Smooth BG Remover API")
+app = FastAPI(title="24/7 Precision Clean BG Remover API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,7 +39,7 @@ def get_session():
 @app.get("/")
 @app.get("/api")
 def health():
-    return {"status": "online", "message": "Ultra Smooth BG Remover Ready"}
+    return {"status": "online", "message": "Precision Clean BG Remover Ready"}
 
 @app.post("/")
 @app.post("/api")
@@ -67,32 +67,39 @@ async def remove_bg(
         img_data = np.transpose(img_data, (2, 0, 1))
         img_data = np.expand_dims(img_data, axis=0)
 
+        # মডেল রান
         ort_session = get_session()
         input_name = ort_session.get_inputs()[0].name
         outputs = ort_session.run(None, {input_name: img_data})
         pred = outputs[0][0, 0]
 
-        # ১. প্রবাবিলিটি নরমাল স্কেলিং
+        # ১. প্রবাবিলিটি নরমালাইজেশন
         d_min, d_max = pred.min(), pred.max()
         norm = (pred - d_min) / (d_max - d_min + 1e-8)
 
-        # ২. মাইল্ড ও ন্যাচারাল ট্রানজিশন (কোনো খাঁজকাটা বা খাবরা ভাব ছাড়া)
-        # ০.৪৬ থেকে ০.৫৬ এর মধ্যে সফট ও পারফেক্ট ব্যালেন্স
-        norm = np.clip((norm - 0.46) / (0.56 - 0.46), 0.0, 1.0)
-        norm = norm * norm * (3.0 - 2.0 * norm)  # Smoothstep Curve
+        # ২. হাই-রেজুলিউশন কন্টিনিউয়াস মাস্ক তৈরি (বিলিনিয়ার দিয়ে স্মুথ ইন্টারপোলেশন)
+        mask_320 = Image.fromarray((norm * 255.0).astype(np.uint8), mode="L")
+        mask_hi = mask_320.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
+        mask_arr = np.array(mask_hi).astype(np.float32) / 255.0
 
-        # ৩. আল্ট্রা-শার্প LANCZOS হাই-রেজুলিউশন মাস্কিং
-        mask_320 = (norm * 255.0).astype(np.uint8)
-        mask = Image.fromarray(mask_320, mode="L").resize(
-            (orig_w, orig_h), Image.Resampling.LANCZOS
-        )
+        # ৩. প্রিসিশন ইনওয়ার্ড কার্ভ (Precision Inward Cutoff)
+        # ০.৫২ এর নিচে থাকা সব বাইরের কালার ও ব্যাকগ্রাউন্ড ১০০% জিরো (জিরো কালার ব্লিড)
+        # ০.৬৫ এর ওপরে থাকা জামা ও শরীর ১০০% সলিড
+        low_t = 0.52
+        high_t = 0.65
+        alpha = np.clip((mask_arr - low_t) / (high_t - low_t), 0.0, 1.0)
+        
+        # হারমাইট স্মুথ কার্ভ (খাবরা ভাব ছাড়া মাখনের মতো বর্ডার)
+        alpha = alpha * alpha * (3.0 - 2.0 * alpha)
 
-        # ৪. সাব-পিক্সেল স্মুথনেস (যাতে কাঁধ ও হাতের ধারগুলো মাখনের মতো মসৃণ হয়)
-        mask = mask.filter(ImageFilter.GaussianBlur(radius=1.0))
+        # ৪. জিরো-টলারেন্স (৮% এর নিচের কোনো আবছা কালার অবশিষ্ট থাকবে না)
+        alpha = np.where(alpha < 0.08, 0.0, alpha)
 
-        # ৫. আসল কালার অক্ষুণ্ণ রেখে পারফেক্ট ট্রান্সপারেন্ট PNG তৈরি
+        final_mask = Image.fromarray((alpha * 255.0).astype(np.uint8), mode="L")
+
+        # ৫. ট্রান্সপারেন্ট পিএনজি আউটপুট
         result = img.copy()
-        result.putalpha(mask)
+        result.putalpha(final_mask)
 
         out_io = io.BytesIO()
         result.save(out_io, format="PNG")
