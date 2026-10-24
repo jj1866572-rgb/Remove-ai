@@ -7,7 +7,7 @@ from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 import onnxruntime as ort
-from PIL import Image, ImageFilter
+from PIL import Image
 
 app = FastAPI(title="24/7 BG Remover API")
 
@@ -58,6 +58,7 @@ async def remove_bg(
         img = Image.open(io.BytesIO(contents)).convert("RGB")
         orig_w, orig_h = img.size
 
+        # ৩২০x৩২০ প্রি-প্রসেসিং
         img_resized = img.resize((320, 320), Image.Resampling.BILINEAR)
         img_data = np.array(img_resized).astype(np.float32) / 255.0
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -66,32 +67,35 @@ async def remove_bg(
         img_data = np.transpose(img_data, (2, 0, 1))
         img_data = np.expand_dims(img_data, axis=0)
 
+        # মডেল রান
         ort_session = get_session()
         input_name = ort_session.get_inputs()[0].name
         outputs = ort_session.run(None, {input_name: img_data})
         pred = outputs[0][0, 0]
 
+        # ১. সঠিক নরমালাইজেশন
         d_min, d_max = pred.min(), pred.max()
         norm = (pred - d_min) / (d_max - d_min + 1e-8)
 
-        # ১. ব্যাকগ্রাউন্ড কাটঅফ (কোনো অবশিষ্টাংশ থাকবে না)
-        norm = np.clip((norm - 0.35) / (0.75 - 0.35), 0.0, 1.0)
-        norm = norm * norm * (3.0 - 2.0 * norm)
+        # ২. হাই-রেজুলিউশন রিসাইজ
+        mask_320 = Image.fromarray((norm * 255.0).astype(np.uint8), mode="L")
+        mask_hi = mask_320.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
+        mask_arr = np.array(mask_hi).astype(np.float32) / 255.0
 
-        # ২. হাই রেজুলিউশন রিসাইজ
-        mask_320 = (norm * 255.0).astype(np.uint8)
-        mask = Image.fromarray(mask_320, mode="L").resize(
-            (orig_w, orig_h), Image.Resampling.LANCZOS
-        )
+        # ৩. ক্রিস্প ও শার্প এজ (ঘোলা/ব্লার ভাব পুরোপুরি বন্ধ করার ফিল্টার)
+        # ০.৪৭ থেকে ০.৫৩ পর্যন্ত মাত্র ১ পিক্সেলের টাইট ট্রানজিশন
+        t_low = 0.48
+        t_high = 0.52
+        alpha = np.clip((mask_arr - t_low) / (t_high - t_low), 0.0, 1.0)
 
-        # ৩. Choke & Feather ম্যাজিক ফিল্টার:
-        # সীমানা থেকে ১ পিক্সেল সাদা বর্ডার স্বয়ংক্রিয়ভাবে মুছে দেবে
-        mask = mask.filter(ImageFilter.MinFilter(3))
-        # ধারের খাঁজগুলো মাখনের মতো মসৃণ করবে
-        mask = mask.filter(ImageFilter.GaussianBlur(radius=0.8))
+        # মসৃণ অ্যান্টি-অ্যালিয়াসিং (যাতে খাঁজকাটা না হয়, কিন্তু পুরোপুরি শার্প থাকে)
+        alpha = alpha * alpha * (3.0 - 2.0 * alpha)
 
+        final_mask = Image.fromarray((alpha * 255.0).astype(np.uint8), mode="L")
+
+        # ৪. ট্রান্সপারেন্ট পিএনজি তৈরি
         result = img.copy()
-        result.putalpha(mask)
+        result.putalpha(final_mask)
 
         out_io = io.BytesIO()
         result.save(out_io, format="PNG")
