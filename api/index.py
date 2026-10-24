@@ -7,9 +7,9 @@ from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 import onnxruntime as ort
-from PIL import Image
+from PIL import Image, ImageFilter
 
-app = FastAPI(title="24/7 BG Remover API")
+app = FastAPI(title="24/7 Clean Cut BG Remover API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,7 +39,7 @@ def get_session():
 @app.get("/")
 @app.get("/api")
 def health():
-    return {"status": "online", "message": "BG Remover is Ready!"}
+    return {"status": "online", "message": "Clean Cut BG Remover Ready"}
 
 @app.post("/")
 @app.post("/api")
@@ -67,7 +67,6 @@ async def remove_bg(
         img_data = np.transpose(img_data, (2, 0, 1))
         img_data = np.expand_dims(img_data, axis=0)
 
-        # মডেল রান
         ort_session = get_session()
         input_name = ort_session.get_inputs()[0].name
         outputs = ort_session.run(None, {input_name: img_data})
@@ -77,25 +76,33 @@ async def remove_bg(
         d_min, d_max = pred.min(), pred.max()
         norm = (pred - d_min) / (d_max - d_min + 1e-8)
 
-        # ২. হাই-রেজুলিউশন রিসাইজ
-        mask_320 = Image.fromarray((norm * 255.0).astype(np.uint8), mode="L")
-        mask_hi = mask_320.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
-        mask_arr = np.array(mask_hi).astype(np.float32) / 255.0
+        # ২. সাদা ব্যাকগ্রাউন্ডের আভা কাটতে হাই-কনফিডেন্স থ্রেশহোল্ড (০.৫৬)
+        norm = np.clip((norm - 0.56) / (0.68 - 0.56), 0.0, 1.0)
+        norm = norm * norm * (3.0 - 2.0 * norm)
 
-        # ৩. ক্রিস্প ও শার্প এজ (ঘোলা/ব্লার ভাব পুরোপুরি বন্ধ করার ফিল্টার)
-        # ০.৪৭ থেকে ০.৫৩ পর্যন্ত মাত্র ১ পিক্সেলের টাইট ট্রানজিশন
-        t_low = 0.48
-        t_high = 0.52
-        alpha = np.clip((mask_arr - t_low) / (t_high - t_low), 0.0, 1.0)
+        # ৩. হাই-রেজুলিউশন মাস্ক
+        mask_320 = (norm * 255.0).astype(np.uint8)
+        mask = Image.fromarray(mask_320, mode="L").resize(
+            (orig_w, orig_h), Image.Resampling.LANCZOS
+        )
 
-        # মসৃণ অ্যান্টি-অ্যালিয়াসিং (যাতে খাঁজকাটা না হয়, কিন্তু পুরোপুরি শার্প থাকে)
-        alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+        # ৪. অটো-চোক (১ পিক্সেল সাদা বর্ডার স্বয়ংক্রিয়ভাবে ছেঁটে ফেলা)
+        mask = mask.filter(ImageFilter.MinFilter(3))
 
-        final_mask = Image.fromarray((alpha * 255.0).astype(np.uint8), mode="L")
+        # ৫. হালকা অ্যান্টি-অ্যালিয়াসিং (যাতে খাবরা না হয়)
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=0.5))
 
-        # ৪. ট্রান্সপারেন্ট পিএনজি তৈরি
-        result = img.copy()
-        result.putalpha(final_mask)
+        # ৬. সীমানা থেকে অতিরিক্ত সাদা আলো মুছে ফেলা
+        img_np = np.array(img).astype(np.float32)
+        alpha_np = np.array(mask).astype(np.float32) / 255.0
+        a = np.expand_dims(alpha_np, axis=2)
+        white_bg = np.array([255.0, 255.0, 255.0], dtype=np.float32)
+        
+        decontam = (img_np - (1.0 - a) * white_bg) / np.maximum(a, 0.4)
+        clean_rgb = np.where((a > 0.05) & (a < 0.95), np.clip(decontam, 0, 255), img_np)
+
+        result = Image.fromarray(clean_rgb.astype(np.uint8), mode="RGB")
+        result.putalpha(mask)
 
         out_io = io.BytesIO()
         result.save(out_io, format="PNG")
