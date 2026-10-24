@@ -39,7 +39,7 @@ def get_session():
 @app.get("/")
 @app.get("/api")
 def health():
-    return {"status": "online", "message": "Studio Quality BG Remover Ready"}
+    return {"status": "online", "message": "Zero-Halo BG Remover Ready"}
 
 @app.post("/")
 @app.post("/api")
@@ -73,29 +73,36 @@ async def remove_bg(
         outputs = ort_session.run(None, {input_name: img_data})
         pred = outputs[0][0, 0]
 
-        # ১. প্রবাবিলিটি স্কেলিং
+        # ১. প্রবাবিলিটি নরমালাইজেশন
         d_min, d_max = pred.min(), pred.max()
         norm = (pred - d_min) / (d_max - d_min + 1e-8)
         norm = np.clip(norm, 0.0, 1.0).astype(np.float32)
 
-        # ২. ৩২-বিট ফ্লোটিং পয়েন্ট (Mode 'F') দিয়ে হাই-রেজুলিউশন বাইকিউবিক রিসাইজিং
-        # (এতে কোনো পিক্সেল ভাঙবে না, খাঁজকাটা ভাব পুরোপুরি বন্ধ হবে)
+        # ২. হাই-রেজুলিউশন ফ্লোট রিসাইজিং (কোনো পিক্সেল যেন না ভাঙে)
         mask_float = Image.fromarray(norm, mode="F")
-        mask_hi_float = mask_float.resize((orig_w, orig_h), Image.Resampling.BICUBIC)
-        norm_hi = np.array(mask_hi_float)
+        mask_hi = mask_float.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
+        alpha = np.array(mask_hi)
 
-        # ৩. প্রিসিশন ইনওয়ার্ড হারমাইট কার্ভ (Precision Hermite Smoothstep)
-        # ০.৫৪ এর নিচে সব ব্যাকগ্রাউন্ড কালার ১০০% জিরো (বাইরে কোনো কালার ছড়াবে না)
-        # ০.৬৪ এর ওপরে জামা ও শরীর ১০০% সলিড
-        # কোনো কৃত্রিম কাট ছাড়াই স্বয়ংক্রিয়ভাবে সিল্কি-স্মুথ এজ তৈরি হবে
-        low_t = 0.54
-        high_t = 0.64
-        alpha = np.clip((norm_hi - low_t) / (high_t - low_t), 0.0, 1.0)
+        # ৩. প্রিসিশন ইনওয়ার্ড টাইট কার্ভ (সাদা আভা কাটার ম্যাথমেটিক্যাল ফিল্টার)
+        # ০.৫৮ এর নিচে থাকা সব ব্যাকগ্রাউন্ড কালার পুরোপুরি ১০০% জিরো
+        # ০.৬৮ এর ওপরে থাকা শরীর ১০০% সলিড
+        low_t = 0.58
+        high_t = 0.68
+        alpha = np.clip((alpha - low_t) / (high_t - low_t), 0.0, 1.0)
+        # স্মুথ হারমাইট কার্ভ (খাবরা ভাব দূর করার ফর্মুলা)
         alpha = alpha * alpha * (3.0 - 2.0 * alpha)
 
-        # ৪. ট্রান্সপারেন্ট পিএনজি তৈরি
+        # ৪. কালার ডিকন্টামিনেশন (কিনারের মিশে থাকা ব্যাকগ্রাউন্ড কালার ধুয়ে ফেলা)
+        img_np = np.array(img).astype(np.float32)
+        a_expanded = np.expand_dims(alpha, axis=2)
+        
+        # কিনারের আধা-স্বচ্ছ পিক্সেলে জমে থাকা ব্যাকগ্রাউন্ড আভা দূর করা
+        clean_rgb = img_np * a_expanded + (1.0 - a_expanded) * np.clip(img_np * 0.8, 0, 255)
+        clean_rgb = np.clip(clean_rgb, 0, 255).astype(np.uint8)
+
+        # ৫. ট্রান্সপারেন্ট পিএনজি তৈরি
+        result = Image.fromarray(clean_rgb, mode="RGB")
         final_mask = Image.fromarray((alpha * 255.0).astype(np.uint8), mode="L")
-        result = img.copy()
         result.putalpha(final_mask)
 
         out_io = io.BytesIO()
