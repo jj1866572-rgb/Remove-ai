@@ -9,7 +9,7 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
-app = FastAPI(title="24/7 Precision Clean BG Remover API")
+app = FastAPI(title="24/7 Studio Quality BG Remover API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,7 +39,7 @@ def get_session():
 @app.get("/")
 @app.get("/api")
 def health():
-    return {"status": "online", "message": "Precision Clean BG Remover Ready"}
+    return {"status": "online", "message": "Studio Quality BG Remover Ready"}
 
 @app.post("/")
 @app.post("/api")
@@ -73,31 +73,28 @@ async def remove_bg(
         outputs = ort_session.run(None, {input_name: img_data})
         pred = outputs[0][0, 0]
 
-        # ১. প্রবাবিলিটি নরমালাইজেশন
+        # ১. প্রবাবিলিটি স্কেলিং
         d_min, d_max = pred.min(), pred.max()
         norm = (pred - d_min) / (d_max - d_min + 1e-8)
+        norm = np.clip(norm, 0.0, 1.0).astype(np.float32)
 
-        # ২. হাই-রেজুলিউশন কন্টিনিউয়াস মাস্ক তৈরি (বিলিনিয়ার দিয়ে স্মুথ ইন্টারপোলেশন)
-        mask_320 = Image.fromarray((norm * 255.0).astype(np.uint8), mode="L")
-        mask_hi = mask_320.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
-        mask_arr = np.array(mask_hi).astype(np.float32) / 255.0
+        # ২. ৩২-বিট ফ্লোটিং পয়েন্ট (Mode 'F') দিয়ে হাই-রেজুলিউশন বাইকিউবিক রিসাইজিং
+        # (এতে কোনো পিক্সেল ভাঙবে না, খাঁজকাটা ভাব পুরোপুরি বন্ধ হবে)
+        mask_float = Image.fromarray(norm, mode="F")
+        mask_hi_float = mask_float.resize((orig_w, orig_h), Image.Resampling.BICUBIC)
+        norm_hi = np.array(mask_hi_float)
 
-        # ৩. প্রিসিশন ইনওয়ার্ড কার্ভ (Precision Inward Cutoff)
-        # ০.৫২ এর নিচে থাকা সব বাইরের কালার ও ব্যাকগ্রাউন্ড ১০০% জিরো (জিরো কালার ব্লিড)
-        # ০.৬৫ এর ওপরে থাকা জামা ও শরীর ১০০% সলিড
-        low_t = 0.52
-        high_t = 0.65
-        alpha = np.clip((mask_arr - low_t) / (high_t - low_t), 0.0, 1.0)
-        
-        # হারমাইট স্মুথ কার্ভ (খাবরা ভাব ছাড়া মাখনের মতো বর্ডার)
+        # ৩. প্রিসিশন ইনওয়ার্ড হারমাইট কার্ভ (Precision Hermite Smoothstep)
+        # ০.৫৪ এর নিচে সব ব্যাকগ্রাউন্ড কালার ১০০% জিরো (বাইরে কোনো কালার ছড়াবে না)
+        # ০.৬৪ এর ওপরে জামা ও শরীর ১০০% সলিড
+        # কোনো কৃত্রিম কাট ছাড়াই স্বয়ংক্রিয়ভাবে সিল্কি-স্মুথ এজ তৈরি হবে
+        low_t = 0.54
+        high_t = 0.64
+        alpha = np.clip((norm_hi - low_t) / (high_t - low_t), 0.0, 1.0)
         alpha = alpha * alpha * (3.0 - 2.0 * alpha)
 
-        # ৪. জিরো-টলারেন্স (৮% এর নিচের কোনো আবছা কালার অবশিষ্ট থাকবে না)
-        alpha = np.where(alpha < 0.08, 0.0, alpha)
-
+        # ৪. ট্রান্সপারেন্ট পিএনজি তৈরি
         final_mask = Image.fromarray((alpha * 255.0).astype(np.uint8), mode="L")
-
-        # ৫. ট্রান্সপারেন্ট পিএনজি আউটপুট
         result = img.copy()
         result.putalpha(final_mask)
 
